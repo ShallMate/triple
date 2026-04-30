@@ -1,375 +1,515 @@
 #include <chrono>
+#include <cstdlib>
 #include <cstdint>
-#include <cstring>
+#include <exception>
 #include <iostream>
-#include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
-#include "yacl/base/byte_container_view.h"
-#include "yacl/base/exception.h"
-#include "yacl/crypto/rand/rand.h"
-#include "yacl/link/test_util.h"
+#include "coproto/Socket/LocalAsyncSock.h"
+#include "coproto/coproto.h"
+#include "cryptoTools/Common/Defines.h"
+#include "cryptoTools/Common/block.h"
+#include "cryptoTools/Crypto/PRNG.h"
+#include "libOTe/Triple/SilentOtTriple/SilentOtTriple.h"
+#include "libOTe/Triple/Foleage/FoleageTriple.h"
+#include "libOTe/TwoChooseOne/ConfigureCode.h"
+#include "libOTe/TwoChooseOne/TcoOtDefines.h"
 
-struct BitVec {
-  size_t nbits = 0;
-  std::vector<uint64_t> w;
+namespace {
 
-  BitVec() = default;
-  explicit BitVec(size_t n) { resize(n); }
-
-  static inline size_t NumWords(size_t nbits) { return (nbits + 63) / 64; }
-
-  inline void resize(size_t n) {
-    nbits = n;
-    w.assign(NumWords(n), 0);
-  }
-
-  inline size_t bytes() const { return w.size() * sizeof(uint64_t); }
-  inline uint64_t* data() { return w.data(); }
-  inline const uint64_t* data() const { return w.data(); }
-
-  inline void mask_last_word() {
-    if (w.empty()) return;
-    const size_t r = nbits & 63;
-    if (r == 0) return;
-    const uint64_t m = (r == 64) ? ~uint64_t(0) : ((uint64_t(1) << r) - 1);
-    w.back() &= m;
-  }
-
-  inline bool get(size_t i) const { return (w[i >> 6] >> (i & 63)) & 1; }
-
-  static BitVec Rand(size_t n) {
-    BitVec out(n);
-    auto rb = yacl::crypto::RandBytes(out.bytes());
-    std::memcpy(out.w.data(), rb.data(), out.bytes());
-    out.mask_last_word();
-    return out;
-  }
-
-  inline void XorInplace(const BitVec& b) {
-    YACL_ENFORCE(nbits == b.nbits, "BitVec xor size mismatch");
-    for (size_t i = 0; i < w.size(); ++i) w[i] ^= b.w[i];
-  }
-
-  static BitVec And(const BitVec& a, const BitVec& b) {
-    YACL_ENFORCE(a.nbits == b.nbits, "BitVec and size mismatch");
-    BitVec out(a.nbits);
-    for (size_t i = 0; i < out.w.size(); ++i) out.w[i] = a.w[i] & b.w[i];
-    return out;
-  }
-
-  static BitVec Xor(const BitVec& a, const BitVec& b) {
-    YACL_ENFORCE(a.nbits == b.nbits, "BitVec xor size mismatch");
-    BitVec out(a.nbits);
-    for (size_t i = 0; i < out.w.size(); ++i) out.w[i] = a.w[i] ^ b.w[i];
-    return out;
-  }
-
-  inline bool Equals(const BitVec& b) const {
-    if (nbits != b.nbits) return false;
-    for (size_t i = 0; i < w.size(); ++i) {
-      if (w[i] != b.w[i]) return false;
-    }
-    return true;
-  }
+struct Config {
+  enum class Method { SilentOtTriple, FoleageTriple, All };
+  enum class Sec { SemiHonest, Malicious, All };
+  std::uint64_t n = 1ULL << 20;
+  Method method = Method::All;
+  Sec sec = Sec::All;
+  bool only_one_code = false;
+  osuCrypto::MultType code = osuCrypto::MultType::ExConv7x24;
 };
 
-static inline void SendBitVec(const std::shared_ptr<yacl::link::Context>& ctx,
-                              int dst, const std::string& tag,
-                              const BitVec& v) {
-  ctx->SendAsync(dst,
-                 yacl::ByteContainerView(
-                     reinterpret_cast<const uint8_t*>(v.data()), v.bytes()),
-                 tag);
+struct NetStats {
+  std::uint64_t sent = 0;
+  std::uint64_t recv = 0;
+};
+
+struct RunStats {
+  double seconds = 0.0;
+  NetStats party0;
+  NetStats party1;
+  std::uint64_t checked = 0;
+};
+
+double BytesToMB(std::uint64_t bytes) {
+  return static_cast<double>(bytes) / (1024.0 * 1024.0);
 }
 
-static inline BitVec RecvBitVec(const std::shared_ptr<yacl::link::Context>& ctx,
-                                int src, const std::string& tag,
-                                size_t nbits) {
-  BitVec out(nbits);
-  auto buf = ctx->Recv(src, tag);
-
-  const int64_t got_i64 = buf.size();
-  YACL_ENFORCE(got_i64 >= 0, "RecvBitVec got negative size={}", got_i64);
-  const size_t got = static_cast<size_t>(got_i64);
-  const size_t expect = out.bytes();
-  YACL_ENFORCE(got == expect, "RecvBitVec size mismatch: got={}, expect={}", got, expect);
-
-  std::memcpy(out.data(), buf.data(), out.bytes());
-  out.mask_last_word();
-  return out;
+void Require(bool cond, const std::string& msg) {
+  if (!cond) {
+    throw std::runtime_error(msg);
+  }
 }
 
-struct RotSendBits { BitVec u0; BitVec u1; };
-struct RotRecvBits { BitVec choice; BitVec ub; };
-struct EdgeRot { RotSendBits send; RotRecvBits recv; };
-struct BitTripleShare { BitVec a; BitVec b; BitVec c; };
-
-static BitTripleShare GenNPartyBitTriplesFromPrecomputedRot(
-    const std::shared_ptr<yacl::link::Context>& ctx, size_t nbits,
-    const std::vector<std::unique_ptr<RotSendBits>>& rot_send,
-    const std::vector<std::unique_ptr<RotRecvBits>>& rot_recv) {
-  const int rank = ctx->Rank();
-  const int world = ctx->WorldSize();
-  YACL_ENFORCE((int)rot_send.size() == world, "rot_send size mismatch");
-  YACL_ENFORCE((int)rot_recv.size() == world, "rot_recv size mismatch");
-
-  BitTripleShare out;
-  out.a = BitVec::Rand(nbits);
-  out.b = BitVec(nbits);
-  out.c = BitVec(nbits);
-
-  bool has_incoming = false;
-  for (int peer = 0; peer < world; ++peer) {
-    if (peer == rank) continue;
-    if (!rot_recv[peer]) continue;
-
-    YACL_ENFORCE(rot_recv[peer]->choice.nbits == nbits, "rot_recv.choice size mismatch");
-    YACL_ENFORCE(rot_recv[peer]->ub.nbits == nbits, "rot_recv.ub size mismatch");
-
-    if (!has_incoming) {
-      out.b = rot_recv[peer]->choice;
-      has_incoming = true;
-    } else {
-      YACL_ENFORCE(out.b.Equals(rot_recv[peer]->choice),
-                   "Incoming ROT choices inconsistent, peer={}", peer);
-    }
+std::string SecToString(osuCrypto::SilentSecType sec) {
+  switch (sec) {
+    case osuCrypto::SilentSecType::SemiHonest:
+      return "semi-honest";
+    case osuCrypto::SilentSecType::Malicious:
+      return "malicious";
   }
-
-  if (!has_incoming) {
-    out.b = BitVec::Rand(nbits);
-  }
-
-  out.c.XorInplace(BitVec::And(out.a, out.b));
-
-  for (int peer = 0; peer < world; ++peer) {
-    if (peer == rank) continue;
-    if (!rot_send[peer]) continue;
-
-    out.c.XorInplace(rot_send[peer]->u0);
-
-    BitVec delta = BitVec::Xor(rot_send[peer]->u0, rot_send[peer]->u1);
-    delta.XorInplace(out.a);
-
-    SendBitVec(ctx, peer,
-               "np_delta/" + std::to_string(rank) + "->" + std::to_string(peer),
-               delta);
-  }
-
-  for (int peer = 0; peer < world; ++peer) {
-    if (peer == rank) continue;
-    if (!rot_recv[peer]) continue;
-
-    BitVec delta = RecvBitVec(ctx, peer,
-                              "np_delta/" + std::to_string(peer) + "->" + std::to_string(rank),
-                              nbits);
-
-    BitVec bd = BitVec::And(out.b, delta);
-    BitVec t  = BitVec::Xor(rot_recv[peer]->ub, bd);
-    out.c.XorInplace(t);
-  }
-
-  ctx->WaitLinkTaskFinish();
-  return out;
+  return "unknown";
 }
 
-static bool ValidateTriplesOpenToRank0(const std::shared_ptr<yacl::link::Context>& ctx,
-                                       const BitTripleShare& s) {
-  const int rank = ctx->Rank();
-  const int world = ctx->WorldSize();
-  const size_t nbits = s.a.nbits;
-  YACL_ENFORCE(s.b.nbits == nbits && s.c.nbits == nbits, "Validate size mismatch");
-
-  if (rank != 0) {
-    SendBitVec(ctx, 0, "open/a/" + std::to_string(rank), s.a);
-    SendBitVec(ctx, 0, "open/b/" + std::to_string(rank), s.b);
-    SendBitVec(ctx, 0, "open/c/" + std::to_string(rank), s.c);
-
-    auto verdict = ctx->Recv(0, "open/verdict");
-    YACL_ENFORCE(verdict.size() == 1, "verdict size invalid");
-    return verdict.data<uint8_t>()[0] != 0;
+std::string ConfigSecToString(Config::Sec sec) {
+  switch (sec) {
+    case Config::Sec::SemiHonest:
+      return "semi-honest";
+    case Config::Sec::Malicious:
+      return "malicious";
+    case Config::Sec::All:
+      return "all";
   }
+  return "unknown";
+}
 
-  BitVec A = s.a, B = s.b, C = s.c;
-
-  for (int p = 1; p < world; ++p) {
-    BitVec ra = RecvBitVec(ctx, p, "open/a/" + std::to_string(p), nbits);
-    BitVec rb = RecvBitVec(ctx, p, "open/b/" + std::to_string(p), nbits);
-    BitVec rc = RecvBitVec(ctx, p, "open/c/" + std::to_string(p), nbits);
-    A.XorInplace(ra);
-    B.XorInplace(rb);
-    C.XorInplace(rc);
+std::string MethodToString(Config::Method method) {
+  switch (method) {
+    case Config::Method::SilentOtTriple:
+      return "SilentOtTriple";
+    case Config::Method::FoleageTriple:
+      return "FoleageTriple";
+    case Config::Method::All:
+      return "all";
   }
+  return "unknown";
+}
 
-  BitVec expect = BitVec::And(A, B);
-  bool ok = C.Equals(expect);
+std::string CodeToString(osuCrypto::MultType code) {
+  switch (code) {
+    case osuCrypto::MultType::QuasiCyclic:
+      return "QuasiCyclic";
+    case osuCrypto::MultType::ExAcc7:
+      return "ExAcc7";
+    case osuCrypto::MultType::ExAcc11:
+      return "ExAcc11";
+    case osuCrypto::MultType::ExAcc21:
+      return "ExAcc21";
+    case osuCrypto::MultType::ExAcc40:
+      return "ExAcc40";
+    case osuCrypto::MultType::ExConv7x24:
+      return "ExConv7x24";
+    case osuCrypto::MultType::ExConv21x24:
+      return "ExConv21x24";
+    case osuCrypto::MultType::Tungsten:
+      return "Tungsten";
+  }
+  return "unknown";
+}
 
-  if (!ok) {
-    for (size_t i = 0; i < nbits; ++i) {
-      const bool e = A.get(i) && B.get(i);
-      if (C.get(i) != e) {
-        std::cerr << "[Validate] mismatch i=" << i
-                  << " A=" << int(A.get(i))
-                  << " B=" << int(B.get(i))
-                  << " C=" << int(C.get(i))
-                  << " expect=" << int(e) << "\n";
-        break;
+osuCrypto::MultType ParseCode(const std::string& code) {
+  if (code == "qc" || code == "quasi" || code == "QuasiCyclic") {
+    return osuCrypto::MultType::QuasiCyclic;
+  }
+  if (code == "exacc7" || code == "ExAcc7") {
+    return osuCrypto::MultType::ExAcc7;
+  }
+  if (code == "exacc11" || code == "ExAcc11") {
+    return osuCrypto::MultType::ExAcc11;
+  }
+  if (code == "exacc21" || code == "ExAcc21") {
+    return osuCrypto::MultType::ExAcc21;
+  }
+  if (code == "exacc40" || code == "ExAcc40") {
+    return osuCrypto::MultType::ExAcc40;
+  }
+  if (code == "exconv7" || code == "ExConv7x24") {
+    return osuCrypto::MultType::ExConv7x24;
+  }
+  if (code == "exconv21" || code == "ExConv21x24") {
+    return osuCrypto::MultType::ExConv21x24;
+  }
+  if (code == "tungsten" || code == "Tungsten") {
+    return osuCrypto::MultType::Tungsten;
+  }
+  throw std::runtime_error("Unsupported --code value: " + code);
+}
+
+Config::Method ParseMethod(const std::string& method) {
+  if (method == "all") {
+    return Config::Method::All;
+  }
+  if (method == "silentot" || method == "silent_ot" ||
+      method == "silentottriple" || method == "SilentOtTriple") {
+    return Config::Method::SilentOtTriple;
+  }
+  if (method == "foleage" || method == "foliage" ||
+      method == "foleagetriple" || method == "FoleageTriple") {
+    return Config::Method::FoleageTriple;
+  }
+  throw std::runtime_error("Unsupported --method value: " + method);
+}
+
+std::vector<Config::Method> MethodList(Config::Method method) {
+  if (method == Config::Method::SilentOtTriple) {
+    return {Config::Method::SilentOtTriple};
+  }
+  if (method == Config::Method::FoleageTriple) {
+    return {Config::Method::FoleageTriple};
+  }
+  return {Config::Method::SilentOtTriple, Config::Method::FoleageTriple};
+}
+
+std::vector<osuCrypto::MultType> DefaultCodes() {
+  return {
+      osuCrypto::MultType::ExAcc7,
+      osuCrypto::MultType::ExAcc11,
+      osuCrypto::MultType::ExAcc21,
+      osuCrypto::MultType::ExAcc40,
+      osuCrypto::MultType::ExConv7x24,
+      osuCrypto::MultType::ExConv21x24,
+      osuCrypto::MultType::QuasiCyclic,
+      osuCrypto::MultType::Tungsten,
+  };
+}
+
+std::vector<osuCrypto::SilentSecType> SecList(Config::Sec sec) {
+  if (sec == Config::Sec::SemiHonest) {
+    return {osuCrypto::SilentSecType::SemiHonest};
+  }
+  if (sec == Config::Sec::Malicious) {
+    return {osuCrypto::SilentSecType::Malicious};
+  }
+  return {osuCrypto::SilentSecType::SemiHonest,
+          osuCrypto::SilentSecType::Malicious};
+}
+
+void PrintUsage(const char* prog) {
+  std::cout << "Usage: " << prog
+            << " [--n N] [--method all|silentot|foleage]"
+               " [--sec semi|mal|all]"
+               " [--code all|exacc7|exacc11|exacc21|exacc40|exconv7|exconv21|qc|tungsten]\n";
+}
+
+Config ParseArgs(int argc, char** argv) {
+  Config cfg;
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "--n") {
+      Require(i + 1 < argc, "Missing value for --n");
+      cfg.n = std::stoull(argv[++i]);
+      Require(cfg.n > 0, "--n must be > 0");
+    } else if (arg == "--method") {
+      Require(i + 1 < argc, "Missing value for --method");
+      cfg.method = ParseMethod(argv[++i]);
+    } else if (arg == "--sec") {
+      Require(i + 1 < argc, "Missing value for --sec");
+      const std::string val = argv[++i];
+      if (val == "semi" || val == "semi-honest") {
+        cfg.sec = Config::Sec::SemiHonest;
+      } else if (val == "mal" || val == "malicious") {
+        cfg.sec = Config::Sec::Malicious;
+      } else if (val == "all") {
+        cfg.sec = Config::Sec::All;
+      } else {
+        throw std::runtime_error("Unsupported --sec value: " + val);
       }
+    } else if (arg == "--mal") {
+      cfg.sec = Config::Sec::Malicious;
+    } else if (arg == "--code") {
+      Require(i + 1 < argc, "Missing value for --code");
+      const std::string val = argv[++i];
+      if (val == "all") {
+        cfg.only_one_code = false;
+      } else {
+        cfg.code = ParseCode(val);
+        cfg.only_one_code = true;
+      }
+    } else if (arg == "--help" || arg == "-h") {
+      PrintUsage(argv[0]);
+      std::exit(0);
+    } else {
+      throw std::runtime_error("Unknown argument: " + arg);
     }
   }
-
-  uint8_t verdict = ok ? 1 : 0;
-  for (int p = 1; p < world; ++p) {
-    ctx->SendAsync(p, yacl::ByteContainerView(&verdict, 1), "open/verdict");
-  }
-  ctx->WaitLinkTaskFinish();
-  return ok;
+  return cfg;
 }
 
-static std::vector<std::vector<EdgeRot>> BuildPrecomputedRotForAllEdges(int world,
-                                                                        size_t nbits) {
-  std::vector<std::vector<EdgeRot>> edge(world, std::vector<EdgeRot>(world));
-  std::vector<BitVec> b_choice(world);
-  for (int j = 0; j < world; ++j) b_choice[j] = BitVec::Rand(nbits);
+osuCrypto::block LastBlockMask(std::uint64_t nbits) {
+  const std::uint64_t rem = nbits & 127;
+  if (rem == 0) {
+    return osuCrypto::block(~0ULL, ~0ULL);
+  }
+  if (rem < 64) {
+    const std::uint64_t lo = (1ULL << rem) - 1;
+    return osuCrypto::block(0, lo);
+  }
+  if (rem == 64) {
+    return osuCrypto::block(0, ~0ULL);
+  }
+  const std::uint64_t hi = (1ULL << (rem - 64)) - 1;
+  return osuCrypto::block(hi, ~0ULL);
+}
 
-  for (int i = 0; i < world; ++i) {
-    for (int j = 0; j < world; ++j) {
-      if (i == j) continue;
+void MaskTail(std::vector<osuCrypto::block>* v, std::uint64_t nbits) {
+  if (!v->empty()) {
+    v->back() &= LastBlockMask(nbits);
+  }
+}
 
-      edge[i][j].send.u0 = BitVec::Rand(nbits);
-      edge[i][j].send.u1 = BitVec::Rand(nbits);
+bool ValidateTriples(const std::vector<osuCrypto::block>& a0,
+                     const std::vector<osuCrypto::block>& b0,
+                     const std::vector<osuCrypto::block>& c0,
+                     const std::vector<osuCrypto::block>& a1,
+                     const std::vector<osuCrypto::block>& b1,
+                     const std::vector<osuCrypto::block>& c1,
+                     std::uint64_t ntriples) {
+  Require(a0.size() == b0.size() && a0.size() == c0.size(),
+          "party0 output size mismatch");
+  Require(a1.size() == b1.size() && a1.size() == c1.size(),
+          "party1 output size mismatch");
+  Require(a0.size() == a1.size(), "party output size mismatch");
 
-      edge[i][j].recv.choice = b_choice[j];
-
-      BitVec u01 = BitVec::Xor(edge[i][j].send.u0, edge[i][j].send.u1);
-      BitVec sel = BitVec::And(b_choice[j], u01);
-      edge[i][j].recv.ub = BitVec::Xor(edge[i][j].send.u0, sel);
+  const auto tail_mask = LastBlockMask(ntriples);
+  for (std::size_t i = 0; i < a0.size(); ++i) {
+    const auto a = a0[i] ^ a1[i];
+    const auto b = b0[i] ^ b1[i];
+    auto c = c0[i] ^ c1[i];
+    auto expect = a & b;
+    if (i + 1 == a0.size()) {
+      c &= tail_mask;
+      expect &= tail_mask;
+    }
+    if (!(c == expect)) {
+      return false;
     }
   }
-  return edge;
+  return true;
 }
 
-struct StatSnap {
-  uint64_t sent = 0;
-  uint64_t recv = 0;
-};
+RunStats RunSilentOtTriple(std::uint64_t ntriples,
+                           osuCrypto::SilentSecType sec,
+                           osuCrypto::MultType code) {
+  using namespace osuCrypto;
 
-static inline StatSnap TakeSnap(const std::shared_ptr<yacl::link::Context>& ctx) {
-  auto st = ctx->GetStats();
-  StatSnap s;
-  s.sent = static_cast<uint64_t>(st->sent_bytes.load());
-  s.recv = static_cast<uint64_t>(st->recv_bytes.load());
-  return s;
-}
+  const std::uint64_t blocks = (ntriples + 127) / 128;
+  std::vector<block> a0(blocks), b0(blocks), c0(blocks);
+  std::vector<block> a1(blocks), b1(blocks), c1(blocks);
+  NetStats net0;
+  NetStats net1;
+  std::exception_ptr ep0;
+  std::exception_ptr ep1;
 
-static void GenOnlyRank(int rank,
-                        const std::shared_ptr<yacl::link::Context>& ctx,
-                        const std::vector<std::vector<EdgeRot>>& edge,
-                        size_t ntriples,
-                        BitTripleShare* out_share) {
-  const int world = ctx->WorldSize();
-  std::vector<std::unique_ptr<RotSendBits>> rot_send(world);
-  std::vector<std::unique_ptr<RotRecvBits>> rot_recv(world);
+  auto sockets = coproto::LocalAsyncSocket::makePair();
+  const auto begin = std::chrono::steady_clock::now();
 
-  for (int peer = 0; peer < world; ++peer) {
-    if (peer == rank) continue;
-
-    {
-      auto p = std::make_unique<RotSendBits>();
-      p->u0 = edge[rank][peer].send.u0;
-      p->u1 = edge[rank][peer].send.u1;
-      rot_send[peer] = std::move(p);
+  std::thread party0([&, sock = std::move(sockets[0])]() mutable {
+    try {
+      PRNG prng(sysRandomSeed());
+      SilentOtTriple triple;
+      triple.mMultType = code;
+      triple.init(0, ntriples, sec, SilentOtTriple::Type::Triple);
+      triple.mMultType = code;
+      coproto::sync_wait(triple.genBaseOts(prng, sock));
+      coproto::sync_wait(triple.expand(a0, b0, c0, prng, sock));
+      coproto::sync_wait(sock.flush());
+      net0.sent = sock.bytesSent();
+      net0.recv = sock.bytesReceived();
+    } catch (...) {
+      ep0 = std::current_exception();
     }
-    {
-      auto p = std::make_unique<RotRecvBits>();
-      p->choice = edge[peer][rank].recv.choice;
-      p->ub     = edge[peer][rank].recv.ub;
-      rot_recv[peer] = std::move(p);
+  });
+
+  std::thread party1([&, sock = std::move(sockets[1])]() mutable {
+    try {
+      PRNG prng(sysRandomSeed());
+      SilentOtTriple triple;
+      triple.mMultType = code;
+      triple.init(1, ntriples, sec, SilentOtTriple::Type::Triple);
+      triple.mMultType = code;
+      coproto::sync_wait(triple.genBaseOts(prng, sock));
+      coproto::sync_wait(triple.expand(a1, b1, c1, prng, sock));
+      coproto::sync_wait(sock.flush());
+      net1.sent = sock.bytesSent();
+      net1.recv = sock.bytesReceived();
+    } catch (...) {
+      ep1 = std::current_exception();
     }
+  });
+
+  party0.join();
+  party1.join();
+
+  if (ep0) {
+    std::rethrow_exception(ep0);
+  }
+  if (ep1) {
+    std::rethrow_exception(ep1);
   }
 
-  *out_share = GenNPartyBitTriplesFromPrecomputedRot(ctx, ntriples, rot_send, rot_recv);
+  MaskTail(&a0, ntriples);
+  MaskTail(&b0, ntriples);
+  MaskTail(&c0, ntriples);
+  MaskTail(&a1, ntriples);
+  MaskTail(&b1, ntriples);
+  MaskTail(&c1, ntriples);
+  Require(ValidateTriples(a0, b0, c0, a1, b1, c1, ntriples),
+          "triple validation failed");
+
+  const auto end = std::chrono::steady_clock::now();
+  return RunStats{
+      .seconds = std::chrono::duration<double>(end - begin).count(),
+      .party0 = net0,
+      .party1 = net1,
+      .checked = ntriples,
+  };
 }
 
-static void ValidateOnlyRank(int rank,
-                             const std::shared_ptr<yacl::link::Context>& ctx,
-                             const BitTripleShare* share,
-                             uint8_t* ok_out) {
-  (void)rank;
-  bool ok = ValidateTriplesOpenToRank0(ctx, *share);
-  *ok_out = ok ? 1 : 0;
+#ifdef ENABLE_FOLEAGE
+RunStats RunFoleageTriple(std::uint64_t ntriples) {
+  using namespace osuCrypto;
+
+  const std::uint64_t blocks = (ntriples + 127) / 128;
+  std::vector<block> a0(blocks), b0(blocks), c0(blocks);
+  std::vector<block> a1(blocks), b1(blocks), c1(blocks);
+  NetStats net0;
+  NetStats net1;
+  std::exception_ptr ep0;
+  std::exception_ptr ep1;
+
+  auto sockets = coproto::LocalAsyncSocket::makePair();
+  const auto begin = std::chrono::steady_clock::now();
+
+  std::thread party0([&, sock = std::move(sockets[0])]() mutable {
+    try {
+      PRNG prng(sysRandomSeed());
+      FoleageTriple triple;
+      triple.init(0, ntriples);
+      coproto::sync_wait(triple.genBaseOts(prng, sock));
+      coproto::sync_wait(triple.expand(a0, b0, c0, prng, sock));
+      coproto::sync_wait(sock.flush());
+      net0.sent = sock.bytesSent();
+      net0.recv = sock.bytesReceived();
+    } catch (...) {
+      ep0 = std::current_exception();
+    }
+  });
+
+  std::thread party1([&, sock = std::move(sockets[1])]() mutable {
+    try {
+      PRNG prng(sysRandomSeed());
+      FoleageTriple triple;
+      triple.init(1, ntriples);
+      coproto::sync_wait(triple.genBaseOts(prng, sock));
+      coproto::sync_wait(triple.expand(a1, b1, c1, prng, sock));
+      coproto::sync_wait(sock.flush());
+      net1.sent = sock.bytesSent();
+      net1.recv = sock.bytesReceived();
+    } catch (...) {
+      ep1 = std::current_exception();
+    }
+  });
+
+  party0.join();
+  party1.join();
+
+  if (ep0) {
+    std::rethrow_exception(ep0);
+  }
+  if (ep1) {
+    std::rethrow_exception(ep1);
+  }
+
+  MaskTail(&a0, ntriples);
+  MaskTail(&b0, ntriples);
+  MaskTail(&c0, ntriples);
+  MaskTail(&a1, ntriples);
+  MaskTail(&b1, ntriples);
+  MaskTail(&c1, ntriples);
+  Require(ValidateTriples(a0, b0, c0, a1, b1, c1, ntriples),
+          "triple validation failed");
+
+  const auto end = std::chrono::steady_clock::now();
+  return RunStats{
+      .seconds = std::chrono::duration<double>(end - begin).count(),
+      .party0 = net0,
+      .party1 = net1,
+      .checked = ntriples,
+  };
 }
+#endif
+
+void PrintStats(const std::string& label, const RunStats& stats) {
+  std::cout << "[" << label << "]\n";
+  std::cout << "  time: " << stats.seconds << " s\n";
+  std::cout << "  party0 sent/recv: " << BytesToMB(stats.party0.sent) << " / "
+            << BytesToMB(stats.party0.recv) << " MB\n";
+  std::cout << "  party1 sent/recv: " << BytesToMB(stats.party1.sent) << " / "
+            << BytesToMB(stats.party1.recv) << " MB\n";
+  std::cout << "  total communication: "
+            << BytesToMB(stats.party0.sent + stats.party0.recv) << " MB\n";
+  std::cout << "  checked: " << stats.checked << " triples\n";
+}
+
+void PrintSkipped(const std::string& label, const std::string& reason) {
+  std::cout << "[" << label << "]\n";
+  std::cout << "  skipped: " << reason << "\n";
+}
+
+}  // namespace
 
 int main(int argc, char** argv) {
-  size_t world_sz = 15;
-  size_t ntriples = 1<<26;
+  try {
+    const auto cfg = ParseArgs(argc, argv);
+    const auto methods = MethodList(cfg.method);
+    const auto secs = SecList(cfg.sec);
+    const auto codes = cfg.only_one_code ? std::vector{cfg.code}
+                                         : DefaultCodes();
 
-  if (argc >= 2) { world_sz = std::stoi(argv[1]);
-}
-  if (argc >= 3) { ntriples = static_cast<size_t>(std::stoull(argv[2]));
-}
+    std::cout << "libOTE triple generator test\n";
+    std::cout << "  n=" << cfg.n << "\n";
+    std::cout << "  method=" << MethodToString(cfg.method) << "\n";
+    std::cout << "  sec=" << ConfigSecToString(cfg.sec) << "\n";
+    std::cout << "  code=" << (cfg.only_one_code ? CodeToString(cfg.code)
+                                                 : std::string("all"))
+              << "\n";
 
-  YACL_ENFORCE(world_sz >= 2, "world must be >= 2");
-  std::cout << "world=" << world_sz << " ntriples=" << ntriples << "\n";
-
-  auto ctxs = yacl::link::test::SetupWorld(world_sz);
-  auto edge = BuildPrecomputedRotForAllEdges((int)world_sz, ntriples);
-
-  std::vector<BitTripleShare> shares(world_sz);
-
-  std::vector<StatSnap> snap0(world_sz);
-  std::vector<StatSnap> snap1(world_sz);
-  for (size_t r = 0; r < world_sz; ++r) snap0[r] = TakeSnap(ctxs[r]);
-
-  auto t0 = std::chrono::high_resolution_clock::now();
-
-  {
-    std::vector<std::thread> ths;
-    ths.reserve(world_sz);
-    for (size_t r = 0; r < world_sz; ++r) {
-      ths.emplace_back([&, r]() { GenOnlyRank((int)r, ctxs[r], edge, ntriples, &shares[r]); });
+    for (const auto method : methods) {
+      if (method == Config::Method::SilentOtTriple) {
+        for (const auto sec : secs) {
+          for (const auto code : codes) {
+            const auto label = MethodToString(method) + " / " +
+                               SecToString(sec) + " / " +
+                               CodeToString(code);
+            try {
+              const auto stats = RunSilentOtTriple(cfg.n, sec, code);
+              PrintStats(label, stats);
+            } catch (const std::exception& e) {
+              PrintSkipped(label, e.what());
+            }
+          }
+        }
+      } else if (method == Config::Method::FoleageTriple) {
+#ifdef ENABLE_FOLEAGE
+        try {
+          const auto stats = RunFoleageTriple(cfg.n);
+          PrintStats(MethodToString(method), stats);
+        } catch (const std::exception& e) {
+          PrintSkipped(MethodToString(method), e.what());
+        }
+#else
+        PrintSkipped(MethodToString(method),
+                     "ENABLE_FOLEAGE is not defined in this libOTE build");
+#endif
+      }
     }
-    for (auto& t : ths) t.join();
-  }
 
-  auto t1 = std::chrono::high_resolution_clock::now();
-  for (size_t r = 0; r < world_sz; ++r) snap1[r] = TakeSnap(ctxs[r]);
-
-  std::chrono::duration<double> gen_sec = t1 - t0;
-
-  uint64_t gen_sent = 0;
-  for (size_t r = 0; r < world_sz; ++r) {
-    gen_sent += (snap1[r].sent - snap0[r].sent);
-  }
-
-  auto bytesToMB = [](uint64_t bytes) -> double {
-    return static_cast<double>(bytes) / (1024.0 * 1024.0);
-  };
-
-  std::cout << "Generation time: " << gen_sec.count() << " seconds.\n";
-  std::cout << "Generation communication: "<< bytesToMB(gen_sent) << " MB\n";
-
-  std::vector<uint8_t> val_ok(world_sz, 0);
-  {
-    std::vector<std::thread> ths;
-    ths.reserve(world_sz);
-    for (size_t r = 0; r < world_sz; ++r) {
-      ths.emplace_back([&, r]() {
-        ValidateOnlyRank((int)r, ctxs[r], &shares[r], &val_ok[r]);
-      });
-    }
-    for (auto& t : ths) t.join();
-  }
-
-  bool all_ok = true;
-  for (size_t r = 0; r < world_sz; ++r) all_ok &= (val_ok[r] != 0);
-
-  if (!all_ok) {
-    std::cerr << "Validation failed on some ranks.\n";
+    std::cout << "matrix completed\n";
+    return 0;
+  } catch (const std::exception& e) {
+    std::cerr << "error: " << e.what() << "\n";
+    PrintUsage(argv[0]);
     return 1;
   }
-  std::cout << "[OK] triples validated (validation not counted in generation time/comm)\n";
-  return 0;
 }
