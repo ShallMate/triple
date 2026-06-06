@@ -308,9 +308,9 @@ RunStats RunSilentOtTriple(std::uint64_t ntriples,
     try {
       PRNG prng(sysRandomSeed());
       SilentOtTriple triple;
-      triple.mMultType = code;
+      triple.mLpnMultType = code;
       triple.init(0, ntriples, sec, SilentOtTriple::Type::Triple);
-      triple.mMultType = code;
+      triple.mLpnMultType = code;
       coproto::sync_wait(triple.genBaseOts(prng, sock));
       coproto::sync_wait(triple.expand(a0, b0, c0, prng, sock));
       coproto::sync_wait(sock.flush());
@@ -325,9 +325,9 @@ RunStats RunSilentOtTriple(std::uint64_t ntriples,
     try {
       PRNG prng(sysRandomSeed());
       SilentOtTriple triple;
-      triple.mMultType = code;
+      triple.mLpnMultType = code;
       triple.init(1, ntriples, sec, SilentOtTriple::Type::Triple);
-      triple.mMultType = code;
+      triple.mLpnMultType = code;
       coproto::sync_wait(triple.genBaseOts(prng, sock));
       coproto::sync_wait(triple.expand(a1, b1, c1, prng, sock));
       coproto::sync_wait(sock.flush());

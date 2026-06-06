@@ -7,7 +7,6 @@ cc_binary(
     srcs = ["main.cc"],
     copts = [
         "-std=c++20",
-        "-I/usr/local/include",
         "-maes",
         "-mpclmul",
         "-msse2",
@@ -19,20 +18,8 @@ cc_binary(
     linkopts = [
         "-no-pie",
         "-Wl,--allow-multiple-definition",
-        "-L/usr/local/lib",
-        "-Wl,--start-group",
-        "-llibOTe",
-        "-lSimplestOT",
-        "-lKyberOT",
-        "-lbitpolymul",
-        "-lrelic_s",
-        "-lcryptoTools",
-        "-lcoproto",
-        "-Wl,--end-group",
-        "-lssl",
-        "-lcrypto",
-        "-lsodium",
-        "-ldl",
-        "-pthread",
+    ],
+    deps = [
+        "@com_github_osu_crypto_libote//:all_deps",
     ],
 )
